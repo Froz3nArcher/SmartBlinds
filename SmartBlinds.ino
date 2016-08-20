@@ -14,17 +14,19 @@
 //      desire #1 below.
 //   5. Solar Power recharges
 // Desires
-//   1. Somehow be configurable without re-programming.
+//   1. Transmit telemetry wirelessly, so that any issues can be diagnosed
+//      from the ground.
+//   2. Somehow be configurable without re-programming.
 //      Ideas: USB connection that connects to Wifi?  USB connection that sets
 //        the values?  Wifi itself?  Probably not, since that would require
 //        continuous operation, and I want to save batteries.  Bluetooth?
-//   2. Solar power recharging?
 ////////////////////////////////////////////////////////////////////////
 
 #include <LowPower.h>
 #include <Servo.h>
 #include <EEPROMLog.h>
 
+// Used for connecting a breadboard prototype, with default serial.
 //#define PROTO 1
 
 // Now using the LM35DZ temperature sensor.
@@ -51,23 +53,25 @@ const int MAX_SERVO_INTERVAL = 5;
 // Delay for 10 seconds after power up.  Allows me to center the servo
 // and then disconnect in order to attach/debug.
 const int CENTERING_DELAY = 10000;
-const int MOVE_DELAY = 2000;
+const int MOVE_DELAY = 3000;
 
 ////////////////////////////////////////////////////////////////////////
 // Pins
 // All the pins chosen are on the right-hand side of the Pro Mini, which
 // allows me to move it far to the left in the installation.
+// The Analog pins are ordered in the manner easiest to wire up the project.
 ////////////////////////////////////////////////////////////////////////
 const int servoPin = 10;  // Servo Library only supports pin 9 and 10
 
 const int transistorPin = 11; // high-side switch transistor
-const int activityPin = 13;  // on-board LED
+const int activityPin = 13;   // on-board LED
 
-const int ldrInputPin = A0; // LDR Sensor Pin
+const int ldrInputPin = A3;  // LDR Sensor Pin
 
-const int tempInputPin = A1; // Temperature Sensor Pin
+const int tempInputPin = A2; // Temperature Sensor Pin
 
-const int batteryPin = A3;  // battery voltage pin
+const int panelPin = A0;     // panel voltage pin
+const int batteryPin = A1;   // battery voltage pin
 
 
 ////////////////////////////////////////////////////////////////////////
@@ -87,8 +91,10 @@ const float MINIMUM_VOLTAGE = 3.0;
 // battery must increase by 0.3 volts before we log a low-battery condition again
 const float RELOG_MINIMUM = 0.3;   
 
-float batteryVolts = 0.0;    // Battery voltage as measured by the processor
+float batteryVoltage = 0.0;    // Battery voltage as measured by the processor
 boolean voltsLogged = false; // indicates we logged a low-battery condition.
+
+float panelVoltage = 0.0;      // Solar Panel voltage
 
 ////////////////////////////////////////////////////////////////////////
 int lightValue = 0;  // analog reading
@@ -97,8 +103,8 @@ unsigned long previousTime = 0;
 unsigned long currentTime = 0;
 unsigned int logCount = 0;
 
-const int CHANGE_LEVEL = 600;  // 400;
-const int LIGHT_DEADBAND = 100; // 200;
+const int CHANGE_LEVEL = 400;
+const int LIGHT_DEADBAND = 150; 
 
 const int SAMPLE_COUNT = 7;              // samples to average the temperature (~60 sec)
 const float MAXIMUM_TEMPERATURE = 30.0;  // about 86 degrees F
@@ -108,7 +114,7 @@ unsigned int numSamples = 0;  // stops incrementing at SAMPLE_COUNT
 
 // Motor moves at SERVO_INTERVAL between these values.
 const int NIGHT_CLOSED = 00;
-const int DAY_OPEN = 85;      // rotated open, down, to let light in
+const int DAY_OPEN = 80;      // rotated open, downs slightly, to let light in
 const int SERVO_CENTER = 90;
 const int HEAT_CLOSED = 165;  // rotated closed, pointing up, to block light
 
@@ -137,13 +143,13 @@ struct logData_t
    int theAngle;                // angle that we're moving to
    int theLight;                // analog light level detected
    float theTemp;               // temperature (analog signal) 
-   float batteryVolts;          // voltage (analog signal)
+   float batteryVolts;          // battery voltage
+   float panelVolts;            // panel voltage
 };
 
 // Declare the EEPROM Logging class instantiation
-byte PATTERN [2] = {0xFF, 0xAA};
+byte PATTERN [2] = {0xFA, 0x01};
 EEPROMLog<logData_t> dataLog (PATTERN);
-boolean dataLogged = false;
 
 
 ////////////////////////////////////////////////////////////////////////
@@ -162,13 +168,12 @@ const float SCALE_FACTOR = 100.0;
 const float ANALOG_SCALE = 1.0 / 1024.0 * AREF_Voltage;
 
 ////////////////////////////////////////////////////////////////////////
-// Returns the battery voltage
+// Returns the voltage voltage from the analog value read in
 ////////////////////////////////////////////////////////////////////////
-float getBattVolts (int value)
+float getVolts (int value)
 {
    return ((float) value) * ANALOG_SCALE;
 }
-
 
 
 ////////////////////////////////////////////////////////////////////////
@@ -178,6 +183,7 @@ float getTemperature (int value)
 {
    return (((float) value) * ANALOG_SCALE - VOLTS_OFFSET) * SCALE_FACTOR;
 }
+
 
 int tempValue = 0; // global for logging
 
@@ -199,6 +205,7 @@ float averageTemperature (float average, float newTemp)
    return average;
 }
 
+
 ////////////////////////////////////////////////////////////////////////
 // Simple degrees C to degrees F conversion for display purposes
 // while debugging.
@@ -214,21 +221,29 @@ float CtoF (float temperature)
 // battery voltage is below the safe minimum.
 // The idea is to protect a Li-Ion battery from over discharge.
 ////////////////////////////////////////////////////////////////////////
-int batteryValue = 0;  // global for logging
 void BatteryManagement ()
 {
-   logData_t event;
+   int batteryValue = 0;
+   int panelValue = 0;
    
+   logData_t event;
+
+   // batteryVoltage and panelVoltage are stored globally so that they
+   // can be logged whenever the blinds change position.
    batteryValue = analogRead (batteryPin);
    batteryValue = analogRead (batteryPin);
-   batteryVolts = getBattVolts (batteryValue);
+   batteryVoltage = getVolts (batteryValue);
+
+   panelValue = analogRead (panelPin);
+   panelValue = analogRead (panelPin);
+   panelVoltage = getVolts (panelValue);
             
 #ifndef SERIAL_DEBUG
    // If we detect that the battery voltage has dropped below the
    // minimum, then log the information.
-   if (batteryVolts > 0.0)
+   if (batteryVoltage > 0.0)
    {
-      if ((batteryVolts <= MINIMUM_VOLTAGE) && !voltsLogged)
+      if ((batteryVoltage <= MINIMUM_VOLTAGE) && !voltsLogged)
       {
          // attempt to capture everything
          logCount++;
@@ -237,11 +252,12 @@ void BatteryManagement ()
          event.theAngle = desiredAngle;
          event.theLight = lightValue;
          event.theTemp = temperature;
-         event.batteryVolts = batteryVolts;
+         event.batteryVolts = batteryVoltage;
+         event.panelVolts = panelVoltage;
          voltsLogged = true;
-         // dataLog.Write (event);
+         dataLog.Write (event);
       }
-      else if (batteryVolts > MINIMUM_VOLTAGE + RELOG_MINIMUM)
+      else if (batteryVoltage > MINIMUM_VOLTAGE + RELOG_MINIMUM)
       {
          // reset the logging mechanism
          voltsLogged = false;
@@ -259,8 +275,9 @@ void reportEntries ()
 {
    logData_t entry;
 
-   char tempC_str [6];
+   char tempC_str [7];
    char battV_str [6];
+   char panelV_str [6];
 
    char buffer [80];
 
@@ -269,12 +286,13 @@ void reportEntries ()
    // Print out on the serial port all the entries found in EEPROM
    while (dataLog.Read (entry))
    {
-      dtostrf (entry.theTemp, 4, 2, tempC_str);
+      dtostrf (entry.theTemp, 5, 2, tempC_str);
       dtostrf (entry.batteryVolts, 4, 2, battV_str);
+      dtostrf (entry.panelVolts, 4, 2, panelV_str);
       count++;
-      sprintf (buffer, "EEPROM # %d \tCount %d \ttime %lu \tangle %d \tlight %d \ttemp %s C \tvolts %s V",
+      sprintf (buffer, "Entry # %d \tCount %d \tTime (ms) %lu \tAngle %d \tLight %d \tTemp %s C \tBattery %s V, Panel %s V",
                count, entry.logCount, entry.theTime, entry.theAngle, entry.theLight,
-               tempC_str, battV_str);
+               tempC_str, battV_str, panelV_str);
 
 #if SERIAL_DEBUG
       Serial.println (buffer);
@@ -345,7 +363,9 @@ boolean Compute (int light, float theTemp)
                desiredAngle = DAY_OPEN;
             }
          }
-         motorState = MOVING;
+         actionNeeded = true;
+         angleServo.attach (servoPin);
+         digitalWrite (transistorPin, LOW);
          break;
 
          
@@ -456,7 +476,6 @@ boolean Compute (int light, float theTemp)
 
    // If the desiredAngle and currentAngle are different, we need to move
    // or continue moving.
-   // dataLogged is used to make 1 entry in the EEPROM log
    if ((desiredAngle != currentAngle) && (motorState != MOVING))
    {
       angleServo.attach (servoPin);
@@ -479,9 +498,10 @@ boolean Compute (int light, float theTemp)
       event.theAngle = desiredAngle;
       event.theLight = light;
       event.theTemp = theTemp;
-      event.batteryVolts = batteryVolts;
+      event.batteryVolts = batteryVoltage;
+      event.panelVolts = panelVoltage;
 
-      // dataLog.Write (event);
+      dataLog.Write (event);
    }
 
    return actionNeeded;
@@ -495,8 +515,10 @@ void loop()
 {   
 #if defined SERIAL_DEBUG || SERIAL_INSTALL
    char outputBuffer [80];
-   char tempC_str [6];
-   char tempF_str [6];
+   char tempC_str [7];
+   char tempF_str [7];
+   char battV_str [6];
+   char panelV_str [6];
 #endif
    
    currentTime = millis ();
@@ -508,12 +530,14 @@ void loop()
          // enable motor movement
          digitalWrite (transistorPin, LOW);
          digitalWrite (activityPin, HIGH);
+         angleServo.write (currentAngle);
          motorState = PAUSED;
       }
       else
       {
          // don't need to drive the motor the whole time
          digitalWrite (transistorPin, HIGH);
+         digitalWrite (activityPin, LOW);
          angleServo.detach ();
       }
    }
@@ -538,17 +562,18 @@ void loop()
 
             BatteryManagement ();
          
+#if defined SERIAL_DEBUG || SERIAL_INSTALL
+            // create an output string for debugging purposes.
+            dtostrf (temperature, 5, 2, tempC_str);
+            dtostrf (CtoF (temperature), 5, 2, tempF_str);
+            dtostrf (batteryVoltage, 4, 2, battV_str);
+            dtostrf (panelVoltage, 4, 2, panelV_str);
+            sprintf (outputBuffer, "time = %lu motorval = %d light = %d temp = %s C %s F BV = %s V PV = %s V",
+                     currentTime, motorState, lightValue, tempC_str, tempF_str, battV_str, panelV_str);
+#endif
 #ifdef SERIAL_DEBUG
-            dtostrf (temperature, 4, 2, tempC_str);
-            dtostrf (CtoF (temperature), 4, 2, tempF_str);
-            sprintf (outputBuffer, "motorval = %d light = %d temp = %s C %s F",
-                     motorState, lightValue, tempC_str, tempF_str);
             Serial.println (outputBuffer);
 #elif SERIAL_INSTALL
-            dtostrf (temperature, 4, 2, tempC_str);
-            dtostrf (CtoF (temperature), 4, 2, tempF_str);
-            sprintf (outputBuffer, "motorval = %d light = %d temp = %s C %s F",
-                     motorState, lightValue, tempC_str, tempF_str);
             portOne.println (outputBuffer);
 #endif
          }
@@ -570,8 +595,11 @@ void loop()
 #ifdef SERIAL_DEBUG
             delay (1000);
 #else
-            delay (1000);
-            // LowPower.powerDown (SLEEP_8S, ADC_OFF, BOD_OFF);
+            // delay (1000);
+            // Due to the use of the sleep function, only about 194 "milliseconds" elapse
+            // between cycles.  The sleep function disables Timer 1, which is the
+            // millisecond timer.
+            LowPower.powerDown (SLEEP_8S, ADC_OFF, BOD_OFF);
 #endif
             digitalWrite (activityPin, HIGH);
          }
